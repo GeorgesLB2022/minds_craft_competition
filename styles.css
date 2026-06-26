@@ -33,6 +33,7 @@ button.success { background: var(--success); color: #07250f; }
 button.warning { background: var(--warning); color: #2d1f00; }
 button.danger { background: var(--danger); }
 button:disabled { opacity: .45; cursor: not-allowed; }
+.badge.danger-badge { background: rgba(251,113,133,.16); color: #fecdd3; }
 input, select, textarea {
   width: 100%;
   background: #0d1728;
@@ -131,6 +132,24 @@ table { width: 100%; border-collapse: collapse; min-width: 820px; }
 th, td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 th { color: #cbd5e1; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
 tr:hover td { background: rgba(255,255,255,.02); }
+.public-row.revealed.public-row-gold td { background: linear-gradient(90deg, rgba(255,215,0,.28), rgba(255,193,7,.12)); }
+.public-row.revealed.public-row-silver td { background: linear-gradient(90deg, rgba(203,213,225,.28), rgba(148,163,184,.12)); }
+.public-row.revealed.public-row-bronze td { background: linear-gradient(90deg, rgba(205,127,50,.30), rgba(180,83,9,.12)); }
+.masked-chip { display: inline-block; width: 92px; height: 14px; border-radius: 999px; background: linear-gradient(90deg, rgba(148,163,184,.18), rgba(96,165,250,.26), rgba(148,163,184,.18)); background-size: 200% 100%; animation: shimmer 1.6s linear infinite; }
+.masked-block { display: inline-block; min-width: 180px; padding: 8px 12px; border-radius: 12px; background: rgba(148,163,184,.12); color: var(--muted); }
+.reveal-btn { min-width: 84px; }
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.station-alert-overdue { border-color: rgba(251,113,133,.45); box-shadow: 0 0 0 1px rgba(251,113,133,.18) inset, var(--shadow); }
+.station-alert-expected { border-color: rgba(251,191,36,.40); box-shadow: 0 0 0 1px rgba(251,191,36,.16) inset, var(--shadow); }
+.summary-card .metric { font-size: 28px; }
+.alert-group { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.alert-group-title { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
+.alert-group-title.expected { color: #fde68a; }
+.alert-group-title.overdue { color: #fecdd3; }
+.alert-line { padding: 8px 10px; border-radius: 12px; font-size: 13px; margin-top: 6px; }
+.alert-line.expected { background: rgba(251,191,36,.10); color: #fde68a; border: 1px solid rgba(251,191,36,.18); }
+.alert-line.overdue { background: rgba(251,113,133,.10); color: #fecdd3; border: 1px solid rgba(251,113,133,.18); }
+.alert-overdue-item { border-color: rgba(251,113,133,.35); }
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
 .tabs button.active { background: rgba(94,234,212,.14); color: var(--accent); }
 .level-card { border: 1px solid rgba(255,255,255,.05); border-radius: 18px; padding: 16px; background: rgba(255,255,255,.02); }

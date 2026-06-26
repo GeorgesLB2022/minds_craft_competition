@@ -29,6 +29,7 @@ const ui = {
   selectedTaskByKid: {},
   selectedResetTaskByKid: {},
   expandedLevels: {},
+  publicReveal: {},
   loading: false,
   error: '',
   lastBootstrapAt: 0
@@ -240,6 +241,87 @@ function getMissionOrderLabelWithTimes(kid) {
 function stationSortValue(label = '') {
   const match = String(label).match(/A(\d+)/i);
   return match ? Number(match[1]) : 999;
+}
+function exportPublicLeaderboardByLevel() {
+  if (!window.XLSX) throw new Error('Excel export library not loaded');
+  const wb = XLSX.utils.book_new();
+  state.levels.forEach(level => {
+    const ranked = leaderboardRows(level.id);
+    const rows = ranked.map((kid, idx) => ({ kid, rank: idx + 1 })).reverse().map(({ kid, rank }) => {
+      const totals = getKidComputedTotals(kid.id);
+      const plan = getKidMissionPlanIds(kid);
+      const missionBreakdown = plan.map((taskId, orderIndex) => {
+        const task = state.tasks.find(item => item.id === taskId);
+        const run = getRunsByKid(kid.id).filter(item => item.task_id === taskId && item.status === 'finished').sort((a, b) => new Date(b.ended_at || b.started_at || 0) - new Date(a.ended_at || a.started_at || 0))[0];
+        const score = run ? Number(run.task_score || 0).toFixed(1) : '—';
+        const duration = run ? fmtSeconds(run.duration_seconds) : '—';
+        return `${orderIndex + 1}. ${task?.name || 'Mission'} | score ${score} | time ${duration}`;
+      }).join(' || ');
+      const isFullyFinished = kid.status === 'finished' || totals.finishedCount >= plan.length;
+      return {
+        Standing: rank === 1 ? '1st' : rank === 2 ? '2nd' : rank === 3 ? '3rd' : 'Achieved Successfully',
+        Rank: rank,
+        Kid: kid.full_name,
+        Badge: kid.badge_number,
+        Level: getLevel(kid.level_id)?.name || '',
+        Status: isFullyFinished ? 'finished' : 'incomplete',
+        'Mission Breakdown': missionBreakdown,
+        'Total Score': Number(totals.averageScore || 0).toFixed(1),
+        'Total Time': fmtSeconds(totals.totalTimeSeconds)
+      };
+    });
+    const sheet = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Message: 'No scored kids yet' }]);
+    XLSX.utils.book_append_sheet(wb, sheet, String(level.name || 'Level').replace(/[^A-Za-z0-9]/g, '').slice(0, 31) || 'Level');
+  });
+  XLSX.writeFile(wb, 'public_leaderboard_by_level.xlsx');
+}
+function getCurrentEventOffsetMinutes() {
+  const now = new Date();
+  return (now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60) - (10 * 60 + 15);
+}
+function getCurrentEventClockLabel() {
+  const now = new Date();
+  return now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+function getActiveBoardStatus() {
+  const currentOffset = getCurrentEventOffsetMinutes();
+  const overdueGrace = 2;
+  const expectedGrace = 1;
+  const stations = [...new Set(state.tasks.map(task => getTaskArea(task)))].sort((a, b) => stationSortValue(a) - stationSortValue(b) || a.localeCompare(b));
+  const stationMap = Object.fromEntries(stations.map(station => [station, { active: [], expected: [], overdue: [] }]));
+  const allExpected = [];
+  const allOverdue = [];
+  const activeRuns = state.taskRuns.filter(run => run.status === 'in_progress');
+  activeRuns.forEach(run => {
+    const task = state.tasks.find(item => item.id === run.task_id);
+    const kid = getKid(run.kid_id);
+    if (!task || !kid) return;
+    const station = getTaskArea(task);
+    const slot = getScheduleEntryByTaskId(kid, task.id);
+    const elapsedSeconds = getRunElapsedSeconds(run);
+    const overdueMinutes = slot ? Math.floor(currentOffset - Number(slot.end || 0)) : 0;
+    const record = { run, task, kid, slot, elapsedSeconds, overdueMinutes };
+    stationMap[station] ||= { active: [], expected: [], overdue: [] };
+    stationMap[station].active.push(record);
+    if (slot && currentOffset > Number(slot.end || 0) + overdueGrace) {
+      stationMap[station].overdue.push(record);
+      allOverdue.push(record);
+    }
+  });
+  state.kids.forEach(kid => {
+    getScheduledEntriesForKid(kid).forEach(entry => {
+      const runs = getRunsByKid(kid.id).filter(run => run.task_id === entry.task_id);
+      const hasFinished = runs.some(run => run.status === 'finished');
+      const hasActive = runs.some(run => run.status === 'in_progress');
+      if (!hasFinished && !hasActive && currentOffset >= Number(entry.start || 0) + expectedGrace && currentOffset <= Number(entry.end || 0) + overdueGrace) {
+        const record = { kid, entry, lateMinutes: Math.max(0, Math.floor(currentOffset - Number(entry.start || 0))) };
+        stationMap[entry.area] ||= { active: [], expected: [], overdue: [] };
+        stationMap[entry.area].expected.push(record);
+        allExpected.push(record);
+      }
+    });
+  });
+  return { currentOffset, stations, stationMap, allExpected, allOverdue };
 }
 function getDefaultMissionPlanIds(levelId) {
   return getTasksByLevel(levelId).map(task => task.id);
@@ -1067,13 +1149,22 @@ function renderLeaderboardPage() {
   return `<div class="topbar"><div><div class="title">Leaderboard</div><div class="subtitle">Sorted by average score descending, then total time ascending.</div></div><select data-action="leaderboard-level"><option value="all">All levels</option>${state.levels.map(level => `<option value="${level.id}" ${ui.leaderboardLevel === level.id ? 'selected' : ''}>${escapeHtml(level.name)}</option>`).join('')}</select></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Kid</th><th>Badge</th><th>Level</th><th>Status</th><th>Total score</th><th>Total time</th><th>Finished at</th></tr></thead><tbody>${leaderboardRows(ui.leaderboardLevel).map((kid, idx) => { const totals = getKidComputedTotals(kid.id); return `<tr><td>${idx + 1}</td><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td>${escapeHtml(getLevel(kid.level_id)?.name || '')}</td><td><span class="badge ${kid.status}">${kid.status}</span></td><td>${Number(totals.averageScore || 0).toFixed(1)}</td><td>${fmtSeconds(totals.totalTimeSeconds)}</td><td>${fmtDate(kid.finished_at)}</td></tr>`; }).join('')}</tbody></table></div></div>`;
 }
 function renderPublicLeaderboardPage() {
-  const rows = leaderboardRows(ui.leaderboardLevel).slice(0, 3);
-  return `<div class="topbar"><div><div class="title">Public Leaderboard</div><div class="subtitle">Top three rows with total result, per-mission score/time, and finished status.</div></div><select data-action="leaderboard-level"><option value="all">All levels</option>${state.levels.map(level => `<option value="${level.id}" ${ui.leaderboardLevel === level.id ? 'selected' : ''}>${escapeHtml(level.name)}</option>`).join('')}</select></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Kid</th><th>Badge</th><th>Level</th><th>Status</th><th>Mission breakdown</th><th>Total score</th><th>Total time</th></tr></thead><tbody>${rows.map((kid, idx) => { const totals = getKidComputedTotals(kid.id); const plan = getKidMissionPlanIds(kid); const missionBreakdown = plan.map((taskId, orderIndex) => { const task = state.tasks.find(item => item.id === taskId); const run = getRunsByKid(kid.id).filter(item => item.task_id === taskId && item.status === 'finished').sort((a, b) => new Date(b.ended_at || b.started_at || 0) - new Date(a.ended_at || a.started_at || 0))[0]; const score = run ? Number(run.task_score || 0).toFixed(1) : '—'; const duration = run ? fmtSeconds(run.duration_seconds) : '—'; return `<div class="small"><b>${orderIndex + 1}. ${escapeHtml(task?.name || 'Mission')}</b> · score ${score} · time ${duration}</div>`; }).join(''); const isFullyFinished = kid.status === 'finished' || totals.finishedCount >= plan.length; return `<tr><td>${idx + 1}</td><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td>${escapeHtml(getLevel(kid.level_id)?.name || '')}</td><td>${isFullyFinished ? '<span class="badge finished">finished</span>' : '<span class="badge waiting">incomplete</span>'}</td><td>${missionBreakdown || '—'}</td><td>${Number(totals.averageScore || 0).toFixed(1)}</td><td>${fmtSeconds(totals.totalTimeSeconds)}</td></tr>`; }).join('') || '<tr><td colspan="8">No scored kids yet.</td></tr>'}</tbody></table></div></div>`;
+  const ranked = leaderboardRows(ui.leaderboardLevel);
+  const rows = ranked.map((kid, idx) => ({ kid, rank: idx + 1 })).reverse();
+  return `<div class="topbar"><div><div class="title">Public Leaderboard</div><div class="subtitle">Rows stay elegantly masked until you reveal them. Order runs from lowest score up to 1st place.</div></div><div class="row"><button class="success" data-action="export-public-levels">Download by level (Excel)</button><select data-action="leaderboard-level"><option value="all">All levels</option>${state.levels.map(level => `<option value="${level.id}" ${ui.leaderboardLevel === level.id ? 'selected' : ''}>${escapeHtml(level.name)}</option>`).join('')}</select></div></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Standing</th><th>Rank</th><th>Reveal</th><th>Kid</th><th>Badge</th><th>Level</th><th>Status</th><th>Mission breakdown</th><th>Total score</th><th>Total time</th></tr></thead><tbody>${rows.map(({ kid, rank }) => { const totals = getKidComputedTotals(kid.id); const plan = getKidMissionPlanIds(kid); const revealed = !!ui.publicReveal[kid.id]; const missionBreakdown = plan.map((taskId, orderIndex) => { const task = state.tasks.find(item => item.id === taskId); const run = getRunsByKid(kid.id).filter(item => item.task_id === taskId && item.status === 'finished').sort((a, b) => new Date(b.ended_at || b.started_at || 0) - new Date(a.ended_at || a.started_at || 0))[0]; const score = run ? Number(run.task_score || 0).toFixed(1) : '—'; const duration = run ? fmtSeconds(run.duration_seconds) : '—'; return `<div class="small"><b>${orderIndex + 1}. ${escapeHtml(task?.name || 'Mission')}</b> · score ${score} · time ${duration}</div>`; }).join(''); const isFullyFinished = kid.status === 'finished' || totals.finishedCount >= plan.length; const standing = rank === 1 ? '1st' : rank === 2 ? '2nd' : rank === 3 ? '3rd' : 'Achieved Successfully'; const rowClass = rank === 1 ? 'public-row-gold' : rank === 2 ? 'public-row-silver' : rank === 3 ? 'public-row-bronze' : ''; const masked = `<span class="masked-chip"></span>`; return `<tr class="public-row ${rowClass} ${revealed ? 'revealed' : 'masked'}"><td><b>${escapeHtml(standing)}</b></td><td>${rank}</td><td><button class="secondary reveal-btn" data-action="toggle-public-row" data-kid-id="${kid.id}">${revealed ? 'Hide' : 'Reveal'}</button></td><td>${revealed ? escapeHtml(kid.full_name) : masked}</td><td>${revealed ? escapeHtml(kid.badge_number) : masked}</td><td>${revealed ? escapeHtml(getLevel(kid.level_id)?.name || '') : masked}</td><td>${revealed ? (isFullyFinished ? '<span class="badge finished">finished</span>' : '<span class="badge waiting">incomplete</span>') : masked}</td><td>${revealed ? (missionBreakdown || '—') : '<span class="masked-block">Mission details hidden</span>'}</td><td>${revealed ? Number(totals.averageScore || 0).toFixed(1) : masked}</td><td>${revealed ? fmtSeconds(totals.totalTimeSeconds) : masked}</td></tr>`; }).join('') || '<tr><td colspan="10">No scored kids yet.</td></tr>'}</tbody></table></div></div>`;
 }
 function renderActiveBoard() {
-  const stations = [...new Set(state.tasks.map(task => getTaskArea(task)))].sort((a, b) => stationSortValue(a) - stationSortValue(b) || a.localeCompare(b));
-  const activeRuns = state.taskRuns.filter(run => run.status === 'in_progress');
-  return `<div class="topbar"><div><div class="title">Active Board</div><div class="subtitle">Per station, showing only kids currently working. Auto-refresh window: 1 minute.</div></div></div><div class="grid cols-2">${stations.map(station => { const rows = activeRuns.map(run => ({ run, task: state.tasks.find(task => task.id === run.task_id), kid: getKid(run.kid_id) })).filter(item => item.task && getTaskArea(item.task) === station && item.kid); return `<div class="card"><div class="row spread"><h3>${escapeHtml(station)}</h3><span class="badge in_progress">${rows.length}</span></div><div class="grid" style="gap:10px; margin-top:12px;">${rows.length ? rows.map(({ run, task, kid }) => `<div class="kid-item"><b>${escapeHtml(kid.full_name)}</b><div class="small muted">${escapeHtml(kid.badge_number)} · ${escapeHtml(task.name)}</div><div class="small muted">Elapsed: ${fmtSeconds(getRunElapsedSeconds(run))}</div></div>`).join('') : '<div class="empty">No active kid at this station</div>'}</div></div>`; }).join('')}</div>`;
+  const board = getActiveBoardStatus();
+  return `<div class="topbar"><div><div class="title">Active Board</div><div class="subtitle">Current event time: ${getCurrentEventClockLabel()} · alerts for expected starts and overdue station exits.</div></div></div>
+    <div class="grid cols-3" style="margin-bottom:18px;">
+      <div class="card summary-card"><div class="muted">Alert summary</div><div class="metric">${board.allExpected.length + board.allOverdue.length}</div><div class="small muted">Expected now + overdue to leave</div></div>
+      <div class="card summary-card station-alert-expected"><div class="muted">Expected now</div><div class="metric">${board.allExpected.length}</div><div class="small muted">Should be in station but not started</div></div>
+      <div class="card summary-card station-alert-overdue"><div class="muted">Overdue to leave station</div><div class="metric">${board.allOverdue.length}</div><div class="small muted">Still active past scheduled end</div></div>
+    </div>
+    <div class="grid cols-2">${board.stations.map(station => { const info = board.stationMap[station] || { active: [], expected: [], overdue: [] }; const stationClass = info.overdue.length ? 'station-alert-overdue' : (info.expected.length ? 'station-alert-expected' : ''); return `<div class="card ${stationClass}"><div class="row spread"><h3>${escapeHtml(station)}</h3><div class="row"><span class="badge in_progress">Active ${info.active.length}</span>${info.expected.length ? `<span class="badge waiting">Expected ${info.expected.length}</span>` : ''}${info.overdue.length ? `<span class="badge danger-badge">Overdue ${info.overdue.length}</span>` : ''}</div></div><div class="grid" style="gap:10px; margin-top:12px;">${info.active.length ? info.active.map(({ run, task, kid, slot, elapsedSeconds, overdueMinutes }) => `<div class="kid-item ${slot && overdueMinutes > 2 ? 'alert-overdue-item' : ''}"><b>${escapeHtml(kid.full_name)}</b><div class="small muted">${escapeHtml(kid.badge_number)} · ${escapeHtml(task.name)}</div><div class="small muted">Scheduled: ${slot ? fmtClockRange(slot.start, slot.end) : '—'}</div><div class="small muted">Elapsed: ${fmtSeconds(elapsedSeconds)}</div>${slot && overdueMinutes > 2 ? `<div class="alert-line overdue">Overdue to leave by ${overdueMinutes} min</div>` : ''}</div>`).join('') : '<div class="empty">No active kid at this station</div>'}
+        ${info.expected.length ? `<div class="alert-group"><div class="alert-group-title expected">Expected now</div>${info.expected.map(({ kid, entry, lateMinutes }) => `<div class="alert-line expected"><b>${escapeHtml(kid.full_name)}</b> (${escapeHtml(kid.badge_number)}) should be here now for ${escapeHtml(entry.mission)} · slot ${fmtClockRange(entry.start, entry.end)}${lateMinutes > 0 ? ` · late by ${lateMinutes} min` : ''}</div>`).join('')}</div>` : ''}
+        ${info.overdue.length ? `<div class="alert-group"><div class="alert-group-title overdue">Overdue to leave station</div>${info.overdue.map(({ kid, task, slot, overdueMinutes }) => `<div class="alert-line overdue"><b>${escapeHtml(kid.full_name)}</b> (${escapeHtml(kid.badge_number)}) still active in ${escapeHtml(task.name)}${slot ? ` · should have left at ${fmtClockMinutes(slot.end)}` : ''}${overdueMinutes > 0 ? ` · overdue by ${overdueMinutes} min` : ''}</div>`).join('')}</div>` : ''}
+      </div></div>`; }).join('')}</div>`;
 }
 function renderLivePage() {
   return `<div class="topbar"><div><div class="title">Live Status Board</div><div class="subtitle">Operational status by kid state.</div></div></div><div class="grid cols-3">${['waiting','in_progress','finished'].map(status => `<div class="card"><div class="row spread"><h3>${status}</h3><span class="badge ${status}">${state.kids.filter(k => k.status === status).length}</span></div><div class="grid" style="gap:10px; margin-top:12px;">${state.kids.filter(k => k.status === status).map(k => { const totals = getKidComputedTotals(k.id); return `<div class="kid-item"><b>${escapeHtml(k.full_name)}</b><div class="small muted">${escapeHtml(getLevel(k.level_id)?.name || '')} · ${escapeHtml(k.badge_number)}</div><div class="row spread" style="margin-top:8px;"><span class="small">Task ${k.current_task_order}</span><span class="small">${Number(totals.averageScore || 0).toFixed(1)} pts</span></div></div>`; }).join('') || '<div class="empty">No kids in this group</div>'}</div></div>`).join('')}</div>`;
@@ -1093,7 +1184,10 @@ function render() {
   if (ui.page === 'active-board') body = renderActiveBoard();
   if (ui.page === 'live') body = renderLivePage();
   renderShell(body);
-  ticker = setInterval(() => { if (ui.page === 'scoring' && getActiveRun(ui.selectedKidId) && !isEditingForm()) render(); }, 1000);
+  ticker = setInterval(() => {
+    if (ui.page === 'scoring' && getActiveRun(ui.selectedKidId) && !isEditingForm()) return render();
+    if (ui.page === 'active-board') return render();
+  }, 1000);
 }
 
 document.addEventListener('submit', async (e) => {
@@ -1136,6 +1230,8 @@ document.addEventListener('click', async (e) => {
     return runAction(() => saveLevelMeta(target.dataset.levelId, { co_name: input?.value || '' }));
   }
   if (action === 'select-kid') { ui.selectedKidId = target.dataset.kidId; ui.page = 'scoring'; const selectedKid = getKid(ui.selectedKidId); ensureSelectedTaskForKid(selectedKid); ensureSelectedResetTaskForKid(selectedKid); return render(); }
+  if (action === 'toggle-public-row') { ui.publicReveal[target.dataset.kidId] = !ui.publicReveal[target.dataset.kidId]; return render(); }
+  if (action === 'export-public-levels') { try { exportPublicLeaderboardByLevel(); } catch (error) { alert(error.message); } return; }
   if (action === 'select-scoring-task') { ui.selectedTaskByKid[target.dataset.kidId] = target.dataset.taskId; return render(); }
   if (action === 'delete-moderator') { if (confirm('Delete this moderator?')) return runAction(() => deleteModerator(target.dataset.userId)); return; }
   if (action === 'reset-kid') { if (confirm('Reset this kid?')) return runAction(() => resetKid(target.dataset.kidId)); return; }
