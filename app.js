@@ -1,6 +1,8 @@
 const SUPABASE_URL = 'https://fkmcttbnskuxwhsvzdmu.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZrbWN0dGJuc2t1eHdoc3Z6ZG11Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MjI5NjkwNSwiZXhwIjoyMDk3ODcyOTA1fQ.2vc3c7xK4L8IyD5-ivpYE_RSYtbRpGEkSHrhXwpFN_k';
 const SESSION_KEY = 'robotics_supabase_direct_session_v1';
+const MISSION_AREA_BY_NAME = window.MISSION_AREA_BY_NAME || {};
+const SCHEDULE_BY_BADGE = window.SCHEDULE_BY_BADGE || {};
 
 const app = document.getElementById('app');
 let ticker = null;
@@ -28,7 +30,8 @@ const ui = {
   selectedResetTaskByKid: {},
   expandedLevels: {},
   loading: false,
-  error: ''
+  error: '',
+  lastBootstrapAt: 0
 };
 
 function escapeHtml(str = '') {
@@ -49,6 +52,25 @@ function fmtSeconds(total) {
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
   return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+}
+
+function fmtClockMinutes(offsetMinutes) {
+  if (offsetMinutes === null || offsetMinutes === undefined || offsetMinutes === '') return '—';
+  const base = new Date(2000, 0, 1, 10, 15 + Number(offsetMinutes), 0, 0);
+  return base.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+function fmtClockRange(start, end) {
+  return `${fmtClockMinutes(start)} - ${fmtClockMinutes(end)}`;
+}
+function parseDurationInput(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  const parts = raw.split(':').map(v => Number(v));
+  if (parts.some(v => Number.isNaN(v))) throw new Error('Invalid duration format. Use seconds or HH:MM:SS');
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  throw new Error('Invalid duration format. Use seconds or HH:MM:SS');
 }
 function nowIso() {
   return new Date().toISOString();
@@ -149,6 +171,76 @@ function getTaskModerator(taskId) {
   const moderatorId = getTaskModeratorId(taskId);
   return state.users.find(user => user.id === moderatorId) || null;
 }
+
+function normalizeMissionName(name = '') {
+  const normalized = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const aliases = {
+    legostructuredobjects: 'lego',
+    legostructuredobject: 'lego'
+  };
+  return aliases[normalized] || normalized;
+}
+function getTaskArea(task) {
+  return task ? (MISSION_AREA_BY_NAME[normalizeMissionName(task.name)] || 'Unassigned station') : 'Unassigned station';
+}
+function getScheduledEntriesForKid(kid) {
+  if (!kid) return [];
+  const rawEntries = SCHEDULE_BY_BADGE[String(kid.badge_number || '')] || [];
+  const levelTasks = getTasksByLevel(kid.level_id);
+  return rawEntries.map(entry => {
+    const task = levelTasks.find(item => normalizeMissionName(item.name) === normalizeMissionName(entry.mission));
+    return task ? { ...entry, task_id: task.id, task_name: task.name, area: entry.area || getTaskArea(task) } : null;
+  }).filter(Boolean).sort((a, b) => Number(a.start) - Number(b.start));
+}
+function getScheduleEntryByTaskId(kid, taskId) {
+  return getScheduledEntriesForKid(kid).find(entry => entry.task_id === taskId) || null;
+}
+function getKidComputedTotals(kidId) {
+  const finishedRuns = getFinishedRunsByKid(kidId);
+  const totalTimeSeconds = finishedRuns.reduce((sum, run) => sum + Number(run.duration_seconds || 0), 0);
+  const averageScore = finishedRuns.length ? finishedRuns.reduce((sum, run) => sum + Number(run.task_score || 0), 0) / finishedRuns.length : 0;
+  return { totalTimeSeconds, averageScore, finishedCount: finishedRuns.length };
+}
+function getLatestTaskScoreForKid(kidId, taskId) {
+  const runs = getRunsByKid(kidId)
+    .filter(run => run.task_id === taskId && run.status === 'finished')
+    .sort((a, b) => new Date(b.ended_at || b.started_at || 0) - new Date(a.ended_at || a.started_at || 0));
+  return runs[0] ? Number(runs[0].task_score || 0) : null;
+}
+function getRunStopPayload(runId) {
+  return getLatestAuditPayload('stop_task_time', 'task_run', runId) || null;
+}
+function isRunTimerStopped(run) {
+  return !!(run && getRunStopPayload(run.id));
+}
+function getRunElapsedSeconds(run) {
+  if (!run) return 0;
+  const stopPayload = getRunStopPayload(run.id);
+  if (stopPayload?.duration_seconds !== undefined && stopPayload?.duration_seconds !== null) {
+    return Number(stopPayload.duration_seconds || 0);
+  }
+  return Math.max(0, Math.floor((Date.now() - new Date(run.started_at).getTime()) / 1000));
+}
+async function syncKidAggregateFields(kidId) {
+  const finishedRuns = await select('task_runs', `?select=duration_seconds,task_score&kid_id=eq.${encodeURIComponent(kidId)}&status=eq.finished`);
+  const totalTimeSeconds = finishedRuns.reduce((sum, run) => sum + Number(run.duration_seconds || 0), 0);
+  const averageScore = finishedRuns.length ? finishedRuns.reduce((sum, run) => sum + Number(run.task_score || 0), 0) / finishedRuns.length : 0;
+  await patchRow('kids', `?id=eq.${encodeURIComponent(kidId)}`, {
+    total_score: averageScore,
+    total_time_seconds: totalTimeSeconds
+  });
+}
+function getMissionOrderLabelWithTimes(kid) {
+  return getKidMissionPlanIds(kid).map((taskId, index) => {
+    const task = state.tasks.find(item => item.id === taskId);
+    const slot = getScheduleEntryByTaskId(kid, taskId);
+    return `${index + 1}. ${task?.name || 'Unknown mission'}${slot ? ` (${fmtClockRange(slot.start, slot.end)})` : ''}`;
+  }).join(' → ');
+}
+function stationSortValue(label = '') {
+  const match = String(label).match(/A(\d+)/i);
+  return match ? Number(match[1]) : 999;
+}
 function getDefaultMissionPlanIds(levelId) {
   return getTasksByLevel(levelId).map(task => task.id);
 }
@@ -156,10 +248,17 @@ function getKidMissionPlanIds(kid) {
   if (!kid) return [];
   const payload = getLatestAuditPayload('set_kid_mission_plan', 'kid', kid.id);
   const levelTaskIds = getDefaultMissionPlanIds(kid.level_id);
-  if (!payload?.mission_ids?.length) return levelTaskIds;
-  const valid = payload.mission_ids.filter(id => levelTaskIds.includes(id));
-  const missing = levelTaskIds.filter(id => !valid.includes(id));
-  return [...valid, ...missing];
+  if (payload?.mission_ids?.length) {
+    const valid = payload.mission_ids.filter(id => levelTaskIds.includes(id));
+    const missing = levelTaskIds.filter(id => !valid.includes(id));
+    return [...valid, ...missing];
+  }
+  const scheduledIds = getScheduledEntriesForKid(kid).map(entry => entry.task_id);
+  if (scheduledIds.length) {
+    const missing = levelTaskIds.filter(id => !scheduledIds.includes(id));
+    return [...scheduledIds, ...missing];
+  }
+  return levelTaskIds;
 }
 function getFinishedTaskIdsByKid(kidId) {
   return [...new Set(getFinishedRunsByKid(kidId).map(run => run.task_id))];
@@ -243,9 +342,8 @@ function computeTaskScore(taskId, values) {
   }, 0);
 }
 function ensureSelectedKid() {
-  if (!ui.selectedKidId || !getKid(ui.selectedKidId)) {
-    ui.selectedKidId = filteredKids()[0]?.id || null;
-  }
+  if (ui.selectedKidId && getKid(ui.selectedKidId)) return;
+  ui.selectedKidId = filteredKids()[0]?.id || state.kids[0]?.id || null;
 }
 function filteredKids() {
   return state.kids.filter(kid => {
@@ -257,8 +355,10 @@ function filteredKids() {
 }
 function leaderboardRows(levelId = 'all') {
   return state.kids.filter(kid => levelId === 'all' ? true : kid.level_id === levelId).slice().sort((a, b) => {
-    if (Number(b.total_score) !== Number(a.total_score)) return Number(b.total_score) - Number(a.total_score);
-    if (Number(a.total_time_seconds) !== Number(b.total_time_seconds)) return Number(a.total_time_seconds) - Number(b.total_time_seconds);
+    const aTotals = getKidComputedTotals(a.id);
+    const bTotals = getKidComputedTotals(b.id);
+    if (Number(bTotals.averageScore) !== Number(aTotals.averageScore)) return Number(bTotals.averageScore) - Number(aTotals.averageScore);
+    if (Number(aTotals.totalTimeSeconds) !== Number(bTotals.totalTimeSeconds)) return Number(aTotals.totalTimeSeconds) - Number(bTotals.totalTimeSeconds);
     return String(a.finished_at || '').localeCompare(String(b.finished_at || ''));
   });
 }
@@ -302,16 +402,13 @@ function initRefreshLoop() {
   if (refreshLoop) return;
   refreshLoop = setInterval(async () => {
     if (!state.user) return;
-    if (['moderators', 'kids', 'levels'].includes(ui.page) && isEditingForm()) return;
+    if (['moderators', 'kids', 'levels', 'scoring'].includes(ui.page) && isEditingForm()) return;
+    if (ui.page === 'active-board' && Date.now() - Number(ui.lastBootstrapAt || 0) < 60000) return;
     await loadBootstrap(true);
   }, 5000);
 }
 async function recalcKidTotals(kidId) {
-  try {
-    await rpc('recalc_kid_totals', { p_kid_id: kidId });
-  } catch (error) {
-    console.warn('recalc_kid_totals unavailable:', error.message);
-  }
+  await syncKidAggregateFields(kidId);
 }
 async function logAction(actionType, entityType, entityId, payloadJson = {}) {
   if (!state.user) return;
@@ -353,6 +450,7 @@ async function loadBootstrap(silent = false) {
     const task = getCurrentTask(kid);
     if (kid && task && !ui.scoringDraft[kid.id]) ui.scoringDraft[kid.id] = defaultDraftForTask(task);
     ui.error = '';
+    ui.lastBootstrapAt = Date.now();
     initRefreshLoop();
   } catch (error) {
     ui.error = error.message;
@@ -654,12 +752,23 @@ async function startTask(kidId, taskId = null) {
   await patchRow('kids', `?id=eq.${encodeURIComponent(kidId)}`, { status: 'in_progress' });
   await logAction('start_task', 'task_run', rows[0]?.id, { kid_id: kidId, task_id: task.id });
 }
+async function stopTaskTime(kidId) {
+  const run = (await select('task_runs', `?select=*&kid_id=eq.${encodeURIComponent(kidId)}&status=eq.in_progress&limit=1`))[0];
+  if (!run) throw new Error('Aucune tâche active');
+  if (isRunTimerStopped(run)) return;
+  const duration = Math.max(1, getRunElapsedSeconds(run));
+  await patchRow('task_runs', `?id=eq.${encodeURIComponent(run.id)}`, { duration_seconds: duration });
+  await logAction('stop_task_time', 'task_run', run.id, { kid_id: kidId, task_id: run.task_id, duration_seconds: duration });
+}
 async function finishTask(kidId, values) {
   const run = (await select('task_runs', `?select=*&kid_id=eq.${encodeURIComponent(kidId)}&status=eq.in_progress&limit=1`))[0];
   if (!run) throw new Error('Aucune tâche active');
   const criteria = await select('criteria', `?select=*&task_id=eq.${encodeURIComponent(run.task_id)}&order=display_order.asc`);
   const endedAt = nowIso();
-  const duration = Math.max(1, Math.floor((new Date(endedAt).getTime() - new Date(run.started_at).getTime()) / 1000));
+  const stopPayload = getRunStopPayload(run.id);
+  const duration = stopPayload?.duration_seconds !== undefined && stopPayload?.duration_seconds !== null
+    ? Math.max(1, Number(stopPayload.duration_seconds || 0))
+    : Math.max(1, Math.floor((new Date(endedAt).getTime() - new Date(run.started_at).getTime()) / 1000));
   let taskScore = 0;
   const details = criteria.map(c => {
     const raw = Number(values?.[c.id] ?? c.min_value ?? 0);
@@ -694,6 +803,18 @@ async function finishTask(kidId, values) {
   await recalcKidTotals(kidId);
   ui.scoringDraft[kidId] = {};
   await logAction('finish_task', 'task_run', run.id, { kid_id: kidId, task_id: run.task_id, duration_seconds: duration, task_score: taskScore });
+}
+async function updateTaskRunResult(kidId, runId, payload) {
+  if (state.user?.role !== 'admin') throw new Error('Only admin can edit mission history');
+  const score = Number(payload.task_score);
+  const durationSeconds = Math.max(0, parseDurationInput(payload.duration_seconds));
+  if (Number.isNaN(score)) throw new Error('Invalid score value');
+  await patchRow('task_runs', `?id=eq.${encodeURIComponent(runId)}`, {
+    task_score: score,
+    duration_seconds: durationSeconds
+  });
+  await syncKidAggregateFields(kidId);
+  await logAction('admin_edit_task_run', 'task_run', runId, { kid_id: kidId, task_score: score, duration_seconds: durationSeconds });
 }
 
 function renderLogin() {
@@ -732,6 +853,8 @@ function renderShell(content) {
           ${adminOnly ? sidebarButton('kids', 'Kids Entry / Management') : ''}
           ${sidebarButton('scoring', 'Moderator Scoring')}
           ${adminOnly ? sidebarButton('leaderboard', 'Leaderboard') : ''}
+          ${adminOnly ? sidebarButton('public-leaderboard', 'Public Leaderboard') : ''}
+          ${adminOnly ? sidebarButton('active-board', 'Active Board') : ''}
           ${adminOnly ? sidebarButton('live', 'Live Status') : ''}
         </div>
         <div class="sidebar-footer">
@@ -747,6 +870,7 @@ function renderShell(content) {
       </main>
     </div>`;
 }
+
 function renderDashboard() {
   const kidsFinished = state.kids.filter(k => k.status === 'finished').length;
   const kidsInProgress = state.kids.filter(k => k.status === 'in_progress').length;
@@ -791,10 +915,10 @@ function renderKidsPage() {
   const levelBlocks = state.levels.map(level => {
     const kids = state.kids.filter(kid => kid.level_id === level.id).sort(compareBadge);
     const tasks = getTasksByLevel(level.id);
-    return `<div class="card" style="margin-top:18px;"><h3>${escapeHtml(level.name)}${getLevelCoName(level.id) ? ` — ${escapeHtml(getLevelCoName(level.id))}` : ''}</h3><div class="table-wrap"><table><thead><tr><th>Kid</th><th>Badge</th><th>Status</th><th>Mission order</th><th>Score</th><th>Time</th><th>Actions</th></tr></thead><tbody>${kids.length ? kids.map(kid => { const plan = getKidMissionPlanIds(kid); return `<tr><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td><span class="badge ${kid.status}">${kid.status}</span></td><td><div class="grid" style="gap:8px;">${tasks.map((task, index) => `<select data-action="kid-mission-slot" data-kid-id="${kid.id}" data-slot-index="${index}">${tasks.map(optionTask => `<option value="${optionTask.id}" ${plan[index] === optionTask.id ? 'selected' : ''}>${index + 1}. ${escapeHtml(optionTask.name)}</option>`).join('')}</select>`).join('')}</div></td><td>${Number(kid.total_score || 0).toFixed(1)}</td><td>${fmtSeconds(kid.total_time_seconds)}</td><td><div class="row"><button class="secondary" data-action="select-kid" data-kid-id="${kid.id}">Open</button><button class="warning" data-action="reset-kid" data-kid-id="${kid.id}">Reset</button><button class="danger" data-action="delete-kid" data-kid-id="${kid.id}">Delete</button></div></td></tr>`; }).join('') : `<tr><td colspan="7">No kids in ${escapeHtml(level.name)} yet.</td></tr>`}</tbody></table></div></div>`;
+    return `<div class="card" style="margin-top:18px;"><h3>${escapeHtml(level.name)}${getLevelCoName(level.id) ? ` — ${escapeHtml(getLevelCoName(level.id))}` : ''}</h3><div class="table-wrap"><table><thead><tr><th>Kid</th><th>Badge</th><th>Status</th><th>Mission order</th><th>Start / End</th><th>Score</th><th>Time</th><th>Actions</th></tr></thead><tbody>${kids.length ? kids.map(kid => { const plan = getKidMissionPlanIds(kid); const totals = getKidComputedTotals(kid.id); const scheduleStack = plan.map((taskId, index) => { const slot = getScheduleEntryByTaskId(kid, taskId); return `<div class="small">${index + 1}. ${slot ? fmtClockRange(slot.start, slot.end) : '—'}</div>`; }).join(''); return `<tr><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td><span class="badge ${kid.status}">${kid.status}</span></td><td><div class="grid" style="gap:8px;">${tasks.map((task, index) => `<select data-action="kid-mission-slot" data-kid-id="${kid.id}" data-slot-index="${index}">${tasks.map(optionTask => `<option value="${optionTask.id}" ${plan[index] === optionTask.id ? 'selected' : ''}>${index + 1}. ${escapeHtml(optionTask.name)}</option>`).join('')}</select>`).join('')}</div></td><td>${scheduleStack || '—'}</td><td>${Number(totals.averageScore || 0).toFixed(1)}</td><td>${fmtSeconds(totals.totalTimeSeconds)}</td><td><div class="row"><button class="secondary" data-action="select-kid" data-kid-id="${kid.id}">Open</button><button class="warning" data-action="reset-kid" data-kid-id="${kid.id}">Reset</button><button class="danger" data-action="delete-kid" data-kid-id="${kid.id}">Delete</button></div></td></tr>`; }).join('') : `<tr><td colspan="8">No kids in ${escapeHtml(level.name)} yet.</td></tr>`}</tbody></table></div></div>`;
   }).join('');
   return `
-    <div class="topbar"><div><div class="title">Kids Entry / Management</div><div class="subtitle">Ajout manuel, import rapide, reset individuel ou global, ordre des missions par kid.</div></div><div class="row"><button class="warning" data-action="reset-all-kids">Reset all kids</button><button class="danger" data-action="delete-all-kids">Delete all kids</button></div></div>
+    <div class="topbar"><div><div class="title">Kids Entry / Management</div><div class="subtitle">Mission order follows the latest student distribution, with scheduled start/end slots shown next to each kid.</div></div><div class="row"><button class="warning" data-action="reset-all-kids">Reset all kids</button><button class="danger" data-action="delete-all-kids">Delete all kids</button></div></div>
     <div class="grid cols-2">
       <div class="card"><h3>Add one kid</h3><form id="add-kid-form" class="form-grid">
         <input name="full_name" placeholder="Kid full name" required />
@@ -805,11 +929,15 @@ function renderKidsPage() {
       <div class="card"><h3>Bulk add kids</h3><form id="bulk-add-kids-form" class="form-grid">
         <select name="level_id">${state.levels.map(l => `<option value="${l.id}">${escapeHtml(l.name)}${getLevelCoName(l.id) ? ` — ${escapeHtml(getLevelCoName(l.id))}` : ''}</option>`).join('')}</select>
         <button type="submit">Import list</button>
-        <textarea class="full" name="rows" rows="8" placeholder="One kid per line. Format: Full Name, Badge Number\nExample:\nSara Ali, K-001\nAdam Noor, K-002"></textarea>
-      </form><div class="small muted" style="margin-top:10px;">Si le badge est omis, il sera généré automatiquement.</div></div>
+        <textarea class="full" name="rows" rows="8" placeholder="One kid per line. Format: Full Name, Badge Number
+Example:
+Sara Ali, K-001
+Adam Noor, K-002"></textarea>
+      </form><div class="small muted" style="margin-top:10px;">If the badge is omitted, it will be generated automatically.</div></div>
     </div>
     ${levelBlocks}`;
 }
+
 function renderLevelsPage() {
   const moderators = getModerators();
   return `
@@ -896,7 +1024,8 @@ function renderScoringPage() {
   const level = kid ? getLevel(kid.level_id) : null;
   const nextTask = kid ? getCurrentTask(kid) : null;
   const activeRun = kid ? getActiveRun(kid.id) : null;
-  const elapsed = activeRun ? Math.floor((Date.now() - new Date(activeRun.started_at).getTime()) / 1000) : 0;
+  const elapsed = activeRun ? getRunElapsedSeconds(activeRun) : 0;
+  const timerStopped = activeRun ? isRunTimerStopped(activeRun) : false;
   const accessMessage = kid ? getScoringAccessMessage(kid) : '';
   const eligibleTasks = kid ? getEligibleTasksForCurrentUser(kid) : [];
   const resettableTasks = kid ? getResettableTasksForCurrentUser(kid) : [];
@@ -905,8 +1034,9 @@ function renderScoringPage() {
   if (kid && task && !ui.scoringDraft[kid.id]) ui.scoringDraft[kid.id] = defaultDraftForTask(task);
   const draft = kid ? (ui.scoringDraft[kid.id] || {}) : {};
   const previewScore = task ? computeTaskScore(task.id, draft) : 0;
+  const totals = kid ? getKidComputedTotals(kid.id) : { averageScore: 0, totalTimeSeconds: 0 };
   return `
-    <div class="topbar"><div><div class="title">Moderator Scoring</div><div class="subtitle">Le modérateur voit l’ordre des missions, mais peut choisir n’importe quelle mission qui lui est assignée tant qu’aucune mission active n’est bloquée ailleurs.</div></div><div class="notice">Flow : pick kid → choose eligible mission → start mission → enter score → finish mission.</div></div>
+    <div class="topbar"><div><div class="title">Moderator Scoring</div><div class="subtitle">Choose any eligible assigned mission, see each kid’s scheduled slot, and freeze the timer with Stop Time before finishing the mission.</div></div><div class="notice">Flow: pick kid → choose eligible mission → start mission → optional Stop Time → enter score → finish mission.</div></div>
     <div class="kids-layout">
       <div class="card">
         <div class="grid" style="gap:10px;">
@@ -922,21 +1052,31 @@ function renderScoringPage() {
       <div class="card">
         ${!kid ? '<div class="empty">Select a kid to start scoring.</div>' : `
           <div class="row spread"><div><div class="title" style="font-size:24px;">${escapeHtml(kid.full_name)}</div><div class="subtitle">${escapeHtml(kid.badge_number)} · ${escapeHtml(level?.name || '')}${getLevelCoName(level?.id) ? ` · ${escapeHtml(getLevelCoName(level?.id))}` : ''}</div></div><span class="badge ${kid.status}">${kid.status}</span></div>
-          <div class="grid cols-3" style="margin-top:18px;"><div class="card"><div class="muted">Next ordered mission</div><div class="metric" style="font-size:22px;">${nextTask ? escapeHtml(nextTask.name) : 'Completed'}</div></div><div class="card"><div class="muted">Total score</div><div class="metric">${Number(kid.total_score || 0).toFixed(1)}</div></div><div class="card"><div class="muted">Total time</div><div class="metric">${fmtSeconds(kid.total_time_seconds)}</div></div></div>
-          <div class="card" style="margin-top:14px;"><div class="small muted">Mission order for this kid</div><div>${escapeHtml(getMissionPlanLabel(kid) || '—')}</div></div>
-          ${eligibleTasks.length ? `<div class="card" style="margin-top:14px;"><div class="small muted">Missions you can select now</div><div class="pill-group" style="margin-top:8px;">${eligibleTasks.map(mission => `<button type="button" class="${mission.id === task?.id ? 'success' : 'secondary'}" data-action="select-scoring-task" data-kid-id="${kid.id}" data-task-id="${mission.id}">${escapeHtml(mission.name)}</button>`).join('')}</div></div>` : ''}
-          ${resettableTasks.length ? `<div class="card" style="margin-top:14px;"><div class="small muted">Mission result to reset</div><div class="row" style="margin-top:8px;"><select data-action="select-reset-task" data-kid-id="${kid.id}" class="grow">${resettableTasks.map(mission => { const runs = getRunsByKid(kid.id).filter(run => run.task_id === mission.id && run.status === 'finished'); const statusLabel = runs.length ? 'finished' : 'not started'; return `<option value="${mission.id}" ${mission.id === resetTask?.id ? 'selected' : ''}>${escapeHtml(mission.name)} — ${statusLabel}</option>`; }).join('')}</select><button class="danger" data-action="reset-mission-result" data-kid-id="${kid.id}">Reset this mission result</button></div></div>` : ''}
+          <div class="grid cols-3" style="margin-top:18px;"><div class="card"><div class="muted">Next ordered mission</div><div class="metric" style="font-size:22px;">${nextTask ? escapeHtml(nextTask.name) : 'Completed'}</div></div><div class="card"><div class="muted">Total score</div><div class="metric">${Number(totals.averageScore || 0).toFixed(1)}</div></div><div class="card"><div class="muted">Total time</div><div class="metric">${fmtSeconds(totals.totalTimeSeconds)}</div></div></div>
+          <div class="card" style="margin-top:14px;"><div class="small muted">Mission order for this kid</div><div>${escapeHtml(getMissionOrderLabelWithTimes(kid) || '—')}</div></div>
+          ${eligibleTasks.length ? `<div class="card" style="margin-top:14px;"><div class="small muted">Missions you can select now</div><div class="pill-group" style="margin-top:8px;">${eligibleTasks.map(mission => { const slot = getScheduleEntryByTaskId(kid, mission.id); return `<button type="button" class="${mission.id === task?.id ? 'success' : 'secondary'}" data-action="select-scoring-task" data-kid-id="${kid.id}" data-task-id="${mission.id}">${escapeHtml(mission.name)}${slot ? ` · ${fmtClockRange(slot.start, slot.end)}` : ''}</button>`; }).join('')}</div></div>` : ''}
+          ${resettableTasks.length ? `<div class="card" style="margin-top:14px;"><div class="small muted">Mission result to reset</div><div class="row" style="margin-top:8px;"><select data-action="select-reset-task" data-kid-id="${kid.id}" class="grow">${resettableTasks.map(mission => { const runs = getRunsByKid(kid.id).filter(run => run.task_id === mission.id && run.status === 'finished'); const statusLabel = runs.length ? 'finished' : 'not started'; const slot = getScheduleEntryByTaskId(kid, mission.id); return `<option value="${mission.id}" ${mission.id === resetTask?.id ? 'selected' : ''}>${escapeHtml(mission.name)}${slot ? ` · ${fmtClockRange(slot.start, slot.end)}` : ''} — ${statusLabel}</option>`; }).join('')}</select><button class="danger" data-action="reset-mission-result" data-kid-id="${kid.id}">Reset this mission result</button></div></div>` : ''}
           ${accessMessage ? `<div class="notice" style="margin-top:16px;">${escapeHtml(accessMessage)}</div>` : ''}
-          ${task && !accessMessage ? `<div class="separator"></div><div class="row spread"><div><h3>${escapeHtml(task.name)}</h3><div class="small muted">${escapeHtml(task.description || '')}</div><div class="small muted">Assigned moderator: ${escapeHtml(getTaskModerator(task.id)?.name || 'Unassigned')}</div></div><div class="timer">${fmtSeconds(elapsed)}</div></div><div class="footer-actions"><button class="success" data-action="start-task" data-kid-id="${kid.id}" data-task-id="${task.id}" ${activeRun ? 'disabled' : ''}>Start mission</button><button class="warning" data-action="finish-task" data-kid-id="${kid.id}" ${!activeRun ? 'disabled' : ''}>Finish mission</button><button class="ghost" data-action="reset-draft" data-kid-id="${kid.id}">Reset score input</button></div><div class="criteria-list">${getCriteriaByTask(task.id).map(criterion => { const value = draft[criterion.id] ?? Number(criterion.min_value || 0); return `<div class="criteria-row"><div class="criteria-head"><div><b>${escapeHtml(criterion.name)}</b><div class="small muted">${criterion.input_type} · range ${criterion.min_value}-${criterion.max_value} · weight ${criterion.weight}</div></div><div class="criteria-value">${value}</div></div>${renderCriteriaInput(criterion, value)}</div>`; }).join('') || '<div class="empty">No criteria configured for this mission yet.</div>'}</div><div class="card" style="margin-top:16px;"><div class="muted">Live mission score preview</div><div class="score-preview">${previewScore.toFixed(1)}</div></div>` : !accessMessage ? '<div class="empty">This kid has finished all missions.</div>' : ''}
-          <div class="separator"></div><h3>Mission history</h3><div class="table-wrap"><table><thead><tr><th>Mission</th><th>Moderator</th><th>Started</th><th>Ended</th><th>Duration</th><th>Score</th></tr></thead><tbody>${getRunsByKid(kid.id).sort((a,b) => new Date(a.started_at) - new Date(b.started_at)).map(run => { const taskRef = state.tasks.find(t => t.id === run.task_id); const moderator = state.users.find(u => u.id === run.moderator_id); return `<tr><td>${escapeHtml(taskRef?.name || '')}</td><td>${escapeHtml(moderator?.name || '')}</td><td>${fmtDate(run.started_at)}</td><td>${fmtDate(run.ended_at)}</td><td>${fmtSeconds(run.duration_seconds)}</td><td>${Number(run.task_score || 0).toFixed(1)}</td></tr>`; }).join('') || '<tr><td colspan="6">No mission run yet.</td></tr>'}</tbody></table></div>`}
+          ${task && !accessMessage ? `<div class="separator"></div><div class="row spread"><div><h3>${escapeHtml(task.name)}</h3><div class="small muted">${escapeHtml(task.description || '')}</div><div class="small muted">Assigned moderator: ${escapeHtml(getTaskModerator(task.id)?.name || 'Unassigned')}</div><div class="small muted">Scheduled slot: ${(() => { const slot = getScheduleEntryByTaskId(kid, task.id); return slot ? fmtClockRange(slot.start, slot.end) : '—'; })()}</div></div><div><div class="timer">${fmtSeconds(elapsed)}</div>${timerStopped ? '<div class="small muted" style="margin-top:8px; text-align:center;">Time stopped</div>' : ''}</div></div><div class="footer-actions"><button class="success" data-action="start-task" data-kid-id="${kid.id}" data-task-id="${task.id}" ${activeRun ? 'disabled' : ''}>Start mission</button><button class="secondary" data-action="stop-task-time" data-kid-id="${kid.id}" ${!activeRun || timerStopped ? 'disabled' : ''}>Stop Time</button><button class="warning" data-action="finish-task" data-kid-id="${kid.id}" ${!activeRun ? 'disabled' : ''}>Finish mission</button><button class="ghost" data-action="reset-draft" data-kid-id="${kid.id}">Reset score input</button></div><div class="criteria-list">${getCriteriaByTask(task.id).map(criterion => { const value = draft[criterion.id] ?? Number(criterion.min_value || 0); return `<div class="criteria-row"><div class="criteria-head"><div><b>${escapeHtml(criterion.name)}</b><div class="small muted">${criterion.input_type} · range ${criterion.min_value}-${criterion.max_value} · weight ${criterion.weight}</div></div><div class="criteria-value">${value}</div></div>${renderCriteriaInput(criterion, value)}</div>`; }).join('') || '<div class="empty">No criteria configured for this mission yet.</div>'}</div><div class="card" style="margin-top:16px;"><div class="muted">Live mission score preview</div><div class="score-preview">${previewScore.toFixed(1)} / 100</div></div>` : !accessMessage ? '<div class="empty">This kid has finished all missions.</div>' : ''}
+          <div class="separator"></div><h3>Mission history</h3><div class="table-wrap"><table><thead><tr><th>Mission</th><th>Moderator</th><th>Started</th><th>Ended</th><th>Duration</th><th>Score</th>${state.user?.role === 'admin' ? '<th>Admin edit</th>' : ''}</tr></thead><tbody>${getRunsByKid(kid.id).sort((a,b) => new Date(a.started_at) - new Date(b.started_at)).map(run => { const taskRef = state.tasks.find(t => t.id === run.task_id); const moderator = state.users.find(u => u.id === run.moderator_id); return `<tr><td>${escapeHtml(taskRef?.name || '')}</td><td>${escapeHtml(moderator?.name || '')}</td><td>${fmtDate(run.started_at)}</td><td>${fmtDate(run.ended_at)}</td><td>${state.user?.role === 'admin' ? `<input data-run-edit="duration" data-run-id="${run.id}" value="${fmtSeconds(run.duration_seconds)}" placeholder="HH:MM:SS" />` : fmtSeconds(run.duration_seconds)}</td><td>${state.user?.role === 'admin' ? `<input type="number" step="0.1" data-run-edit="score" data-run-id="${run.id}" value="${Number(run.task_score || 0).toFixed(1)}" />` : Number(run.task_score || 0).toFixed(1)}</td>${state.user?.role === 'admin' ? `<td><button class="secondary" data-action="save-run-edit" data-kid-id="${kid.id}" data-run-id="${run.id}">Save</button></td>` : ''}</tr>`; }).join('') || `<tr><td colspan="${state.user?.role === 'admin' ? '7' : '6'}">No mission run yet.</td></tr>`}</tbody></table></div>`}
       </div>
     </div>`;
 }
+
 function renderLeaderboardPage() {
-  return `<div class="topbar"><div><div class="title">Leaderboard</div><div class="subtitle">Trié par score décroissant puis temps croissant.</div></div><select data-action="leaderboard-level"><option value="all">All levels</option>${state.levels.map(level => `<option value="${level.id}" ${ui.leaderboardLevel === level.id ? 'selected' : ''}>${escapeHtml(level.name)}</option>`).join('')}</select></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Kid</th><th>Badge</th><th>Level</th><th>Status</th><th>Total score</th><th>Total time</th><th>Finished at</th></tr></thead><tbody>${leaderboardRows(ui.leaderboardLevel).map((kid, idx) => `<tr><td>${idx + 1}</td><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td>${escapeHtml(getLevel(kid.level_id)?.name || '')}</td><td><span class="badge ${kid.status}">${kid.status}</span></td><td>${Number(kid.total_score || 0).toFixed(1)}</td><td>${fmtSeconds(kid.total_time_seconds)}</td><td>${fmtDate(kid.finished_at)}</td></tr>`).join('')}</tbody></table></div></div>`;
+  return `<div class="topbar"><div><div class="title">Leaderboard</div><div class="subtitle">Sorted by average score descending, then total time ascending.</div></div><select data-action="leaderboard-level"><option value="all">All levels</option>${state.levels.map(level => `<option value="${level.id}" ${ui.leaderboardLevel === level.id ? 'selected' : ''}>${escapeHtml(level.name)}</option>`).join('')}</select></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Kid</th><th>Badge</th><th>Level</th><th>Status</th><th>Total score</th><th>Total time</th><th>Finished at</th></tr></thead><tbody>${leaderboardRows(ui.leaderboardLevel).map((kid, idx) => { const totals = getKidComputedTotals(kid.id); return `<tr><td>${idx + 1}</td><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td>${escapeHtml(getLevel(kid.level_id)?.name || '')}</td><td><span class="badge ${kid.status}">${kid.status}</span></td><td>${Number(totals.averageScore || 0).toFixed(1)}</td><td>${fmtSeconds(totals.totalTimeSeconds)}</td><td>${fmtDate(kid.finished_at)}</td></tr>`; }).join('')}</tbody></table></div></div>`;
+}
+function renderPublicLeaderboardPage() {
+  const rows = leaderboardRows(ui.leaderboardLevel).slice(0, 3);
+  return `<div class="topbar"><div><div class="title">Public Leaderboard</div><div class="subtitle">Top three rows with total result, per-mission score/time, and finished status.</div></div><select data-action="leaderboard-level"><option value="all">All levels</option>${state.levels.map(level => `<option value="${level.id}" ${ui.leaderboardLevel === level.id ? 'selected' : ''}>${escapeHtml(level.name)}</option>`).join('')}</select></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Kid</th><th>Badge</th><th>Level</th><th>Status</th><th>Mission breakdown</th><th>Total score</th><th>Total time</th></tr></thead><tbody>${rows.map((kid, idx) => { const totals = getKidComputedTotals(kid.id); const plan = getKidMissionPlanIds(kid); const missionBreakdown = plan.map((taskId, orderIndex) => { const task = state.tasks.find(item => item.id === taskId); const run = getRunsByKid(kid.id).filter(item => item.task_id === taskId && item.status === 'finished').sort((a, b) => new Date(b.ended_at || b.started_at || 0) - new Date(a.ended_at || a.started_at || 0))[0]; const score = run ? Number(run.task_score || 0).toFixed(1) : '—'; const duration = run ? fmtSeconds(run.duration_seconds) : '—'; return `<div class="small"><b>${orderIndex + 1}. ${escapeHtml(task?.name || 'Mission')}</b> · score ${score} · time ${duration}</div>`; }).join(''); const isFullyFinished = kid.status === 'finished' || totals.finishedCount >= plan.length; return `<tr><td>${idx + 1}</td><td>${escapeHtml(kid.full_name)}</td><td>${escapeHtml(kid.badge_number)}</td><td>${escapeHtml(getLevel(kid.level_id)?.name || '')}</td><td>${isFullyFinished ? '<span class="badge finished">finished</span>' : '<span class="badge waiting">incomplete</span>'}</td><td>${missionBreakdown || '—'}</td><td>${Number(totals.averageScore || 0).toFixed(1)}</td><td>${fmtSeconds(totals.totalTimeSeconds)}</td></tr>`; }).join('') || '<tr><td colspan="8">No scored kids yet.</td></tr>'}</tbody></table></div></div>`;
+}
+function renderActiveBoard() {
+  const stations = [...new Set(state.tasks.map(task => getTaskArea(task)))].sort((a, b) => stationSortValue(a) - stationSortValue(b) || a.localeCompare(b));
+  const activeRuns = state.taskRuns.filter(run => run.status === 'in_progress');
+  return `<div class="topbar"><div><div class="title">Active Board</div><div class="subtitle">Per station, showing only kids currently working. Auto-refresh window: 1 minute.</div></div></div><div class="grid cols-2">${stations.map(station => { const rows = activeRuns.map(run => ({ run, task: state.tasks.find(task => task.id === run.task_id), kid: getKid(run.kid_id) })).filter(item => item.task && getTaskArea(item.task) === station && item.kid); return `<div class="card"><div class="row spread"><h3>${escapeHtml(station)}</h3><span class="badge in_progress">${rows.length}</span></div><div class="grid" style="gap:10px; margin-top:12px;">${rows.length ? rows.map(({ run, task, kid }) => `<div class="kid-item"><b>${escapeHtml(kid.full_name)}</b><div class="small muted">${escapeHtml(kid.badge_number)} · ${escapeHtml(task.name)}</div><div class="small muted">Elapsed: ${fmtSeconds(getRunElapsedSeconds(run))}</div></div>`).join('') : '<div class="empty">No active kid at this station</div>'}</div></div>`; }).join('')}</div>`;
 }
 function renderLivePage() {
-  return `<div class="topbar"><div><div class="title">Live Status Board</div><div class="subtitle">Vue opérationnelle terrain.</div></div></div><div class="grid cols-3">${['waiting','in_progress','finished'].map(status => `<div class="card"><div class="row spread"><h3>${status}</h3><span class="badge ${status}">${state.kids.filter(k => k.status === status).length}</span></div><div class="grid" style="gap:10px; margin-top:12px;">${state.kids.filter(k => k.status === status).map(k => `<div class="kid-item"><b>${escapeHtml(k.full_name)}</b><div class="small muted">${escapeHtml(getLevel(k.level_id)?.name || '')} · ${escapeHtml(k.badge_number)}</div><div class="row spread" style="margin-top:8px;"><span class="small">Task ${k.current_task_order}</span><span class="small">${Number(k.total_score || 0).toFixed(1)} pts</span></div></div>`).join('') || '<div class="empty">No kids in this group</div>'}</div></div>`).join('')}</div>`;
+  return `<div class="topbar"><div><div class="title">Live Status Board</div><div class="subtitle">Operational status by kid state.</div></div></div><div class="grid cols-3">${['waiting','in_progress','finished'].map(status => `<div class="card"><div class="row spread"><h3>${status}</h3><span class="badge ${status}">${state.kids.filter(k => k.status === status).length}</span></div><div class="grid" style="gap:10px; margin-top:12px;">${state.kids.filter(k => k.status === status).map(k => { const totals = getKidComputedTotals(k.id); return `<div class="kid-item"><b>${escapeHtml(k.full_name)}</b><div class="small muted">${escapeHtml(getLevel(k.level_id)?.name || '')} · ${escapeHtml(k.badge_number)}</div><div class="row spread" style="margin-top:8px;"><span class="small">Task ${k.current_task_order}</span><span class="small">${Number(totals.averageScore || 0).toFixed(1)} pts</span></div></div>`; }).join('') || '<div class="empty">No kids in this group</div>'}</div></div>`).join('')}</div>`;
 }
 function render() {
   clearInterval(ticker);
@@ -949,9 +1089,11 @@ function render() {
   if (ui.page === 'kids') body = renderKidsPage();
   if (ui.page === 'scoring') body = renderScoringPage();
   if (ui.page === 'leaderboard') body = renderLeaderboardPage();
+  if (ui.page === 'public-leaderboard') body = renderPublicLeaderboardPage();
+  if (ui.page === 'active-board') body = renderActiveBoard();
   if (ui.page === 'live') body = renderLivePage();
   renderShell(body);
-  ticker = setInterval(() => { if (getActiveRun(ui.selectedKidId)) render(); }, 1000);
+  ticker = setInterval(() => { if (ui.page === 'scoring' && getActiveRun(ui.selectedKidId) && !isEditingForm()) render(); }, 1000);
 }
 
 document.addEventListener('submit', async (e) => {
@@ -1005,6 +1147,7 @@ document.addEventListener('click', async (e) => {
   if (action === 'delete-criterion') { if (confirm('Delete this criterion?')) return runAction(() => deleteCriterion(target.dataset.criterionId)); return; }
   if (action === 'replicate-criteria-from-task') { if (confirm('Replicate this criteria set to all other missions?')) return runAction(() => replicateCriteriaFromTask(target.dataset.taskId)); return; }
   if (action === 'start-task') return runAction(() => startTask(target.dataset.kidId, target.dataset.taskId || null));
+  if (action === 'stop-task-time') return runAction(() => stopTaskTime(target.dataset.kidId));
   if (action === 'finish-task') { const kid = getKid(target.dataset.kidId); return runAction(() => finishTask(target.dataset.kidId, ui.scoringDraft[kid.id] || {})); }
   if (action === 'reset-draft') {
     const kid = getKid(target.dataset.kidId);
@@ -1021,6 +1164,15 @@ document.addEventListener('click', async (e) => {
     if (!kid || !task) return;
     ui.scoringDraft[kid.id] = defaultDraftForTask(task);
     return runAction(() => resetMissionScoring(kid.id, task.id));
+  }
+  if (action === 'save-run-edit') {
+    const row = target.closest('tr');
+    const durationInput = row?.querySelector(`[data-run-edit="duration"][data-run-id="${target.dataset.runId}"]`);
+    const scoreInput = row?.querySelector(`[data-run-edit="score"][data-run-id="${target.dataset.runId}"]`);
+    return runAction(() => updateTaskRunResult(target.dataset.kidId, target.dataset.runId, {
+      duration_seconds: durationInput?.value || '0',
+      task_score: scoreInput?.value || '0'
+    }));
   }
   if (action === 'set-criterion') { const kid = getKid(ui.selectedKidId); ui.scoringDraft[kid.id] ||= {}; ui.scoringDraft[kid.id][target.dataset.criterionId] = Number(target.dataset.value); render(); }
 });
